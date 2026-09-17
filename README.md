@@ -21,12 +21,17 @@ It is an experimental use of the plugin interface, not a supported GCC server mo
 On the measured macOS host, the STL-PCH workload took **89.4 ms per job with fresh
 g++ versus 45.2 ms with forked children**. See [results and limitations](RESULTS.md).
 
+Retested with **SFPI 7.74.0 / GCC 15.1.0**: the same PCH workload improved from
+**100.5 to 44.4 ms on Blackhole** and **102.1 to 43.3 ms on Wormhole**. These are
+macOS-hosted cross-compilation timings. See [SFPI results and build details](SFPI_RESULTS.md).
+
 ## Files
 
 - [fork_server.cc](fork_server.cc): the compiler plugin and single-client request loop.
 - [benchmark.py](benchmark.py): build, timing, output comparison, and execution validation.
 - [results-macos.json](results-macos.json): measured samples, commands, PIDs, startup times and checks.
 - [RESULTS.md](RESULTS.md): readable measured results and limitations.
+- [SFPI_RESULTS.md](SFPI_RESULTS.md): SFPI results, object validation, and build provenance.
 
 ## Reproduce
 
@@ -44,6 +49,33 @@ python3 benchmark.py \
 
 On Linux pass the path to GNU `g++`, for example `/usr/bin/g++`. On macOS,
 `/usr/bin/g++` is normally Apple Clang and is not suitable for this experiment.
+
+### Cross-compilers, including SFPI
+
+The plugin runs on the **host**, even when the compiler generates code for another
+architecture. Build it with a host compiler using the cross-compiler's matching
+plugin headers. For a plugin-enabled SFPI installation:
+
+```sh
+python3 benchmark.py \
+  --gxx /path/to/sfpi/compiler/bin/riscv-tt-elf-g++ \
+  --plugin-cxx /path/to/host/g++ \
+  --extra-flag=-mcpu=tt-bh \
+  --validation objects \
+  --work-dir /tmp/sfpi-fork-toy \
+  --results results-sfpi.json
+```
+
+`--validation objects` assembles each fork-generated result and compares it
+byte-for-byte with an object freshly compiled from the same source. It does not
+claim to execute target code. All three timing modes use the same compiler and
+target flags.
+
+An uninstalled GCC build can be selected with `--extra-flag=-B/path/to/build/gcc/`.
+Use repeated `--plugin-include` arguments for its generated GCC headers, GCC source
+directory, source `include`, and source `libcpp/include` directories. The compiler
+must have been built with `--enable-plugin`; a host compiler cannot add plugin
+support to an existing cross-compiler executable.
 
 ## What is compared
 
@@ -73,8 +105,9 @@ than a pure kernel-level fork-versus-exec microbenchmark.
 
 - Every measured assembly file is nonempty and byte-identical across all three
   modes for the same input.
-- Every distinct fork-generated program is assembled, linked, and executed with an
-  expected-result check, outside timing.
+- In the default `execute` mode, every distinct fork-generated program is assembled,
+  linked, and executed with an expected-result check, outside timing. Cross-compiler
+  `objects` mode instead compares target object files with fresh compilation.
 - An invalid source must report failure, followed by a successful valid compilation
   using the same parent.
 - GCC's `-H` output verifies that the STL PCH is actually accepted; a successful
@@ -99,7 +132,7 @@ than a pure kernel-level fork-versus-exec microbenchmark.
   Linux SFPI performance or full tt-metal JIT speedup.
 
 The next useful experiment is the same benchmark on a representative Linux host,
-followed by real SFPI translation units and flags. A production fork server would
+followed by real tt-metal kernel translation units and flags. A production fork server would
 need request-specific input/output handling, bounded concurrency, lifecycle/error
 handling, and an explicit compiler/toolchain identity.
 

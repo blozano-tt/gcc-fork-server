@@ -1,5 +1,7 @@
 # GCC fork-server results
 
+For the later SFPI cross-compiler retest, see [SFPI results](SFPI_RESULTS.md).
+
 **The mechanism worked with unmodified GNU GCC 16.1.0 plus a small plugin.** Forked children continued inside `cc1plus` without `exec()`, compiled different source contents, and produced the same assembly as fresh compiler processes.
 
 ## Environment and method

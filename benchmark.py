@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 """Compare fresh g++, fresh cc1plus, and a real compiler fork server.
 
-All timed jobs emit assembly (-S). Assembly/link/execution validation is untimed.
+All timed jobs emit assembly (-S). Object/execution validation is untimed.
 Run on a trusted local machine; the experimental server accepts one client.
 """
 import argparse
@@ -89,6 +89,13 @@ def source(profile, value):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--gxx', required=True, help='Real GNU g++, built with plugin support')
+    parser.add_argument('--plugin-cxx', help='Host C++ compiler for the plugin (defaults to --gxx)')
+    parser.add_argument('--plugin-include', action='append', default=[],
+                        help='Plugin header include directory; repeat for an uninstalled GCC build')
+    parser.add_argument('--extra-flag', action='append', default=[],
+                        help='Target compiler flag, e.g. --extra-flag=-mcpu=tt-bh')
+    parser.add_argument('--validation', choices=['execute', 'objects'], default='execute',
+                        help='Use objects for cross-compilers whose output cannot run on the host')
     parser.add_argument('--work-dir', type=Path, required=True)
     parser.add_argument('--results', type=Path, required=True)
     parser.add_argument('--jobs', type=int, default=20)
@@ -103,8 +110,10 @@ def main():
     root = args.work_dir.resolve()
     root.mkdir(parents=True, exist_ok=True)
     plugin = root / 'fork_server.so'
-    plugin_inc = Path(run([gxx, '-print-file-name=plugin']).stdout.strip()) / 'include'
-    build = [gxx, '-std=c++17', '-O2', '-shared', '-fPIC', '-fno-rtti', '-I' + str(plugin_inc)]
+    plugin_includes = args.plugin_include or [str(Path(run([gxx, '-print-file-name=plugin']).stdout.strip()) / 'include')]
+    plugin_cxx = str(Path(args.plugin_cxx).resolve()) if args.plugin_cxx else gxx
+    build = [plugin_cxx, '-std=c++17', '-O2', '-shared', '-fPIC', '-fno-rtti']
+    build += ['-I' + directory for directory in plugin_includes]
     if platform.system() == 'Darwin':
         build += ['-Wl,-undefined,dynamic_lookup']
         if Path('/opt/homebrew/include').exists():
@@ -113,6 +122,8 @@ def main():
     run(build)
     report = dict(compiler=version, compiler_path=gxx, platform=platform.platform(),
                   jobs_per_round=args.jobs, rounds=args.rounds, timed_output='assembly (-S)',
+                  target=run([gxx, '-dumpmachine']).stdout.strip(),
+                  target_extra_flags=args.extra_flag, validation=args.validation,
                   plugin_build_command=build, profiles={})
     rng = random.Random(1729)
     modes = ['fresh_g++', 'fresh_cc1plus', 'forked_cc1plus']
@@ -122,7 +133,7 @@ def main():
         src, asm = work / 'input.cc', work / 'output.s'
         hdr = work / 'headers.h'
         hdr.write_text(HEADERS)
-        flags = ['-std=c++17', '-O2', '-frandom-seed=gcc-fork-toy']
+        flags = ['-std=c++17', '-O2', '-frandom-seed=gcc-fork-toy', *args.extra_flag]
         if profile == 'stl_pch':
             run([gxx, *flags, '-x', 'c++-header', str(hdr), '-o', str(hdr) + '.gch'])
         if profile != 'tiny':
@@ -178,7 +189,7 @@ def main():
                             verified += 1
                         else:
                             expected_hashes[key] = digest
-                        # Every distinct source is also assembled, linked, and executed below.
+                        # Every distinct source receives untimed validation below.
                         if mode == 'forked_cc1plus':
                             saved_path = work / f'job_{value}.s'
                             saved_path.write_bytes(data)
@@ -211,16 +222,27 @@ def main():
                            for line in probe_log.read_text().splitlines())
             assert accepted, probe_log.read_text()
             item['fork_pch_acceptance_verified'] = True
-        # Validate the actual generated machine code, outside all benchmark measurements.
+        # Validate output outside all benchmark measurements. Cross-compilation verifies
+        # target object equality, without claiming execution on the host or a TT device.
         main_cc = work / 'main.cc'
         exe = work / 'validate'
+        object_checks = 0
         for value, saved_path in saved.items():
-            expected = 3 * 7 + value if profile == 'tiny' else 7 + value + 4
-            main_cc.write_text(f'extern "C" int evaluate(int);\nint main() {{ return evaluate(7) != {expected}; }}\n')
-            run([gxx, str(saved_path), str(main_cc), '-o', str(exe)])
-            run([str(exe)])
+            if args.validation == 'execute':
+                expected = 3 * 7 + value if profile == 'tiny' else 7 + value + 4
+                main_cc.write_text(f'extern "C" int evaluate(int);\nint main() {{ return evaluate(7) != {expected}; }}\n')
+                run([gxx, *args.extra_flag, str(saved_path), str(main_cc), '-o', str(exe)])
+                run([str(exe)])
+            else:
+                fork_obj, fresh_obj = work / 'fork.o', work / 'fresh.o'
+                run([gxx, *args.extra_flag, '-c', str(saved_path), '-o', str(fork_obj)])
+                src.write_text(source(profile, value))
+                run([gxx, *flags, '-c', str(src), '-o', str(fresh_obj)])
+                assert fork_obj.read_bytes() == fresh_obj.read_bytes(), (profile, value, 'object mismatch')
+                object_checks += 1
         item['assembly_equality_checks'] = verified
-        item['executed_distinct_programs'] = len(saved)
+        item['executed_distinct_programs'] = len(saved) if args.validation == 'execute' else 0
+        item['target_object_equality_checks'] = object_checks
         item['child_pids'] = server.children
         item['median_job_ms'] = {m: statistics.median(sum(item['timings_ms'][m], [])) for m in modes}
         item['median_batch_ms'] = {m: statistics.median([sum(block) for block in item['timings_ms'][m]]) for m in modes}
@@ -231,7 +253,7 @@ def main():
               f"speedup={item['fork_speedup_vs_gxx']:.2f}x", flush=True)
         args.results.parent.mkdir(parents=True, exist_ok=True)
         args.results.write_text(json.dumps(report, indent=2) + '\n')
-    print('PASS: all assembly comparisons, executable checks, and error-recovery checks', flush=True)
+    print(f'PASS: assembly comparisons, {args.validation} validation, and error-recovery checks', flush=True)
 
 
 if __name__ == '__main__':
